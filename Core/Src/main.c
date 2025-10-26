@@ -18,24 +18,36 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "adc.h"
+#include "dac.h"
+#include "dma.h"
 #include "eth.h"
+#include "tim.h"
 #include "usart.h"
 #include "usb_otg.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdlib.h>
+#include "arm_math.h"
+#include "fir.h"
+#include "fir_coeffs_361Taps_44100_200_3000.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+enum AdcDmaState {
+	FILLING_FIRST_HALF, FILLING_SECOND_HALF
+};
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define IO_BUFFER_SIZE 8192
+#define IO_BUFFER_HALF_SIZE IO_BUFFER_SIZE / 2
+#define SAMPLE_RATE 44100
+#define MAX_VALUE_FROM_ADC 0x0FFF
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -46,7 +58,29 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+static uint32_t g_adcBuffer[IO_BUFFER_SIZE];
+static uint32_t g_dacBuffer1[IO_BUFFER_SIZE];
+static uint32_t g_dacBuffer2[IO_BUFFER_SIZE];
 
+static float32_t g_inputBuffer[IO_BUFFER_HALF_SIZE];
+static float32_t g_iBuffer[IO_BUFFER_HALF_SIZE];
+static float32_t g_qBuffer[IO_BUFFER_HALF_SIZE];
+static float32_t g_tmpBuffer1[IO_BUFFER_HALF_SIZE];
+static float32_t g_tmpBuffer2[IO_BUFFER_HALF_SIZE];
+
+static arm_fir_instance_f32 g_filterFir1;
+static float32_t g_filterFir1State[FILTER_TAP_NUM + IO_BUFFER_HALF_SIZE - 1];
+static arm_fir_instance_f32 g_filterFir2;
+static float32_t g_filterFir2State[FILTER_TAP_NUM + IO_BUFFER_HALF_SIZE - 1];
+
+static arm_fir_instance_f32 g_delayFir;
+static float32_t g_delayFirState[HILBERT_AND_DELAY_FILTERS_TAP_NUM + IO_BUFFER_HALF_SIZE - 1];
+
+static arm_fir_instance_f32 g_hilbertFir;
+static float32_t g_hilbertFirState[HILBERT_AND_DELAY_FILTERS_TAP_NUM + IO_BUFFER_HALF_SIZE - 1];
+
+static volatile enum AdcDmaState g_adcDmaState = FILLING_FIRST_HALF;
+static volatile int g_isDspPerformed = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -57,7 +91,89 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
+{
+	g_adcDmaState = FILLING_SECOND_HALF;
+	g_isDspPerformed = 0;
+}
 
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+	g_adcDmaState = FILLING_FIRST_HALF;
+	g_isDspPerformed = 0;
+}
+
+static void performDsp()
+{
+	if (!g_isDspPerformed) {
+		g_isDspPerformed = 1;
+
+		uint32_t currentDacIndex1 = __HAL_DMA_GET_COUNTER(hdac1.DMA_Handle1);
+		uint32_t currentDacIndex2 = __HAL_DMA_GET_COUNTER(hdac1.DMA_Handle2);
+
+		switch (g_adcDmaState) {
+		case FILLING_FIRST_HALF:
+			for (int i = 0; i < IO_BUFFER_HALF_SIZE; i++) {
+				//g_iBuffer[i] = g_adcBuffer[IO_BUFFER_HALF_SIZE + i];
+				g_inputBuffer[i] = g_adcBuffer[IO_BUFFER_HALF_SIZE + i];
+				//g_qBuffer[i] = MAX_VALUE_FROM_ADC - g_adcBuffer[IO_BUFFER_HALF_SIZE + i];
+			}
+			break;
+
+		case FILLING_SECOND_HALF:
+			for (int i = 0; i < IO_BUFFER_HALF_SIZE; i++) {
+				//g_iBuffer[i] = g_adcBuffer[i];
+				g_inputBuffer[i] = g_adcBuffer[i];
+				//g_qBuffer[i] = MAX_VALUE_FROM_ADC - g_adcBuffer[i];
+			}
+			break;
+		}
+
+		arm_fir_f32(&g_filterFir1, g_inputBuffer, g_tmpBuffer1, IO_BUFFER_HALF_SIZE);
+
+		arm_fir_f32(&g_delayFir, g_tmpBuffer1, g_iBuffer, IO_BUFFER_HALF_SIZE);
+		arm_fir_f32(&g_hilbertFir, g_tmpBuffer1, g_qBuffer, IO_BUFFER_HALF_SIZE);
+
+		//arm_fir_f32(&g_filterFir1, g_tmpBuffer1, g_iBuffer, IO_BUFFER_HALF_SIZE);
+		for (int i = 0; i < IO_BUFFER_HALF_SIZE; i++) {
+			g_iBuffer[i] += MAX_VALUE_FROM_ADC / 2;
+		}
+
+		for (int i = 0; i < IO_BUFFER_HALF_SIZE; i++) {
+			g_qBuffer[i] += MAX_VALUE_FROM_ADC / 2;
+		}
+
+		/*arm_fir_f32(&g_delayFir, g_inputBuffer, g_tmpBuffer1, IO_BUFFER_HALF_SIZE);
+		arm_fir_f32(&g_hilbertFir, g_inputBuffer, g_tmpBuffer2, IO_BUFFER_HALF_SIZE);
+
+		arm_fir_f32(&g_filterFir1, g_tmpBuffer1, g_iBuffer, IO_BUFFER_HALF_SIZE);
+		for (int i = 0; i < IO_BUFFER_HALF_SIZE; i++) {
+			g_iBuffer[i] += MAX_VALUE_FROM_ADC / 2;
+		}
+
+		arm_fir_f32(&g_filterFir2, g_tmpBuffer2, g_qBuffer, IO_BUFFER_HALF_SIZE);
+		for (int i = 0; i < IO_BUFFER_HALF_SIZE; i++) {
+			g_qBuffer[i] += MAX_VALUE_FROM_ADC / 2;
+		}*/
+
+
+
+		for (int i = 0; i < IO_BUFFER_HALF_SIZE; i++) {
+			int dstDacIndex1 = currentDacIndex1 + IO_BUFFER_HALF_SIZE + i;
+			if (dstDacIndex1 >= IO_BUFFER_SIZE) {
+				dstDacIndex1 -= IO_BUFFER_SIZE;
+			}
+
+			int dstDacIndex2 = currentDacIndex2 + IO_BUFFER_HALF_SIZE + i;
+			if (dstDacIndex2 >= IO_BUFFER_SIZE) {
+				dstDacIndex2 -= IO_BUFFER_SIZE;
+			}
+
+			g_dacBuffer1[dstDacIndex1] = g_iBuffer[i];
+			g_dacBuffer2[dstDacIndex2] = g_qBuffer[i];
+		}
+	}
+}
 /* USER CODE END 0 */
 
 /**
@@ -88,17 +204,30 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_ETH_Init();
+  MX_DMA_Init();
   MX_USART3_UART_Init();
   MX_USB_OTG_HS_USB_Init();
+  MX_TIM6_Init();
+  MX_ADC3_Init();
+  MX_ETH_Init();
+  MX_DAC1_Init();
   /* USER CODE BEGIN 2 */
+  HAL_TIM_Base_Start(&htim6);
+  HAL_ADC_Start_DMA(&hadc3, g_adcBuffer, IO_BUFFER_SIZE);
+  HAL_DAC_Start_DMA(&hdac1, DAC1_CHANNEL_1, g_dacBuffer1, IO_BUFFER_SIZE, DAC_ALIGN_12B_R);
+  HAL_DAC_Start_DMA(&hdac1, DAC1_CHANNEL_2, g_dacBuffer2, IO_BUFFER_SIZE, DAC_ALIGN_12B_R);
 
+  arm_fir_init_f32(&g_filterFir1, FILTER_TAP_NUM, filter_taps, g_filterFir1State, IO_BUFFER_HALF_SIZE);
+  arm_fir_init_f32(&g_filterFir2, FILTER_TAP_NUM, filter_taps, g_filterFir2State, IO_BUFFER_HALF_SIZE);
+  arm_fir_init_f32(&g_delayFir, HILBERT_AND_DELAY_FILTERS_TAP_NUM, coeffs_delay_361, g_delayFirState, IO_BUFFER_HALF_SIZE);
+  arm_fir_init_f32(&g_hilbertFir, HILBERT_AND_DELAY_FILTERS_TAP_NUM, coeffs_hilbert_361Taps_44100_200_3000, g_hilbertFirState, IO_BUFFER_HALF_SIZE);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+	  performDsp();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
